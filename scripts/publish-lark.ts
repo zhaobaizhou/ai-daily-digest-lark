@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 
 const LARK_BASE_URL = process.env.LARK_BASE_URL || "https://open.feishu.cn";
+const LARK_WIKI_BASE_URL = process.env.LARK_WIKI_BASE_URL || "https://bai-zhou.feishu.cn";
 
 function required(name: string): string {
   const value = process.env[name];
@@ -62,20 +63,61 @@ function todayInShanghai(): string {
   }).format(new Date());
 }
 
-function textElement(content: string) {
+function cleanInline(input: string): string {
+  return input
+    .replace(/\\([\\`*_{}\[\]()#+\-.!>])/g, "$1")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, "\"")
+    .replace(/&#39;/g, "'")
+    .replace(/&nbsp;/g, " ")
+    .replace(/<[^>]+>/g, "")
+    .replace(/\*\*(.*?)\*\*/g, "$1")
+    .replace(/__(.*?)__/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\*(.*?)\*/g, "$1")
+    .trim();
+}
+
+function textElement(content: string, url?: string) {
   return {
     text_run: {
-      content,
-      text_element_style: {},
+      content: cleanInline(content),
+      text_element_style: url ? { link: { url } } : {},
     },
   };
+}
+
+function inlineElements(content: string) {
+  const elements: any[] = [];
+  const linkPattern = /\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g;
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = linkPattern.exec(content)) !== null) {
+    const before = content.slice(cursor, match.index);
+    if (cleanInline(before)) {
+      elements.push(textElement(before));
+    }
+
+    elements.push(textElement(match[1], match[2]));
+    cursor = match.index + match[0].length;
+  }
+
+  const rest = content.slice(cursor);
+  if (cleanInline(rest)) {
+    elements.push(textElement(rest));
+  }
+
+  return elements.length > 0 ? elements : [textElement(content)];
 }
 
 function paragraph(content: string) {
   return {
     block_type: 2,
     text: {
-      elements: [textElement(content)],
+      elements: inlineElements(content),
       style: {},
     },
   };
@@ -83,10 +125,11 @@ function paragraph(content: string) {
 
 function heading(level: number, content: string) {
   const safeLevel = Math.min(Math.max(level, 1), 6);
+
   return {
     block_type: 2 + safeLevel,
     [`heading${safeLevel}`]: {
-      elements: [textElement(content)],
+      elements: inlineElements(content),
       style: {},
     },
   };
@@ -102,54 +145,128 @@ function splitLongLine(line: string, max = 900): string[] {
   return parts;
 }
 
+function parseTableRow(line: string): string[] {
+  return line
+    .trim()
+    .replace(/^\|/, "")
+    .replace(/\|$/, "")
+    .split("|")
+    .map((cell) => cleanInline(cell.trim()));
+}
+
+function isTableSeparator(line: string): boolean {
+  return /^\|?[\s:|-]+\|?$/.test(line.trim());
+}
+
 function markdownToBlocks(markdown: string) {
   const blocks: any[] = [];
+  const lines = markdown.split(/\r?\n/);
+
   let inCodeFence = false;
+  let inMermaid = false;
+  let inDetails = false;
 
-  for (const rawLine of markdown.split(/\r?\n/)) {
+  for (let i = 0; i < lines.length; i++) {
+    const rawLine = lines[i];
     const line = rawLine.trimEnd();
+    const trimmed = line.trim();
 
-    if (!line.trim()) continue;
+    if (!trimmed) continue;
 
-    if (line.trim().startsWith("```")) {
-      inCodeFence = !inCodeFence;
-      blocks.push(paragraph(line));
+    if (trimmed === "<details>") {
+      inDetails = true;
       continue;
     }
 
-    if (!inCodeFence) {
-      const headingMatch = line.match(/^(#{1,6})\s+(.+)$/);
-      if (headingMatch) {
-        blocks.push(heading(headingMatch[1].length, headingMatch[2].trim()));
-        continue;
-      }
-
-      const bulletMatch = line.match(/^[-*]\s+(.+)$/);
-      if (bulletMatch) {
-        for (const part of splitLongLine(`• ${bulletMatch[1].trim()}`)) {
-          blocks.push(paragraph(part));
-        }
-        continue;
-      }
-
-      const numberedMatch = line.match(/^(\d+)\.\s+(.+)$/);
-      if (numberedMatch) {
-        for (const part of splitLongLine(`${numberedMatch[1]}. ${numberedMatch[2].trim()}`)) {
-          blocks.push(paragraph(part));
-        }
-        continue;
-      }
-
-      const quoteMatch = line.match(/^>\s?(.+)$/);
-      if (quoteMatch) {
-        for (const part of splitLongLine(`> ${quoteMatch[1].trim()}`)) {
-          blocks.push(paragraph(part));
-        }
-        continue;
-      }
+    if (trimmed === "</details>") {
+      inDetails = false;
+      continue;
     }
 
-    for (const part of splitLongLine(line.trim())) {
+    if (inDetails) continue;
+
+    if (/^```mermaid/i.test(trimmed)) {
+      inMermaid = true;
+      continue;
+    }
+
+    if (inMermaid) {
+      if (trimmed === "```") {
+        inMermaid = false;
+        continue;
+      }
+
+      const category = trimmed.match(/^"(.+)"\s*:\s*(\d+)$/);
+      if (category) {
+        blocks.push(paragraph(`• ${category[1]}：${category[2]} 篇`));
+      }
+
+      continue;
+    }
+
+    if (trimmed.startsWith("```")) {
+      inCodeFence = !inCodeFence;
+      continue;
+    }
+
+    if (inCodeFence) {
+      for (const part of splitLongLine(line)) {
+        blocks.push(paragraph(part));
+      }
+      continue;
+    }
+
+    if (/^---+$/.test(trimmed)) continue;
+
+    if (
+      trimmed.startsWith("|") &&
+      i + 1 < lines.length &&
+      isTableSeparator(lines[i + 1])
+    ) {
+      const headers = parseTableRow(trimmed);
+      i += 2;
+
+      while (i < lines.length && lines[i].trim().startsWith("|")) {
+        const values = parseTableRow(lines[i]);
+        const summary = headers
+          .map((header, index) => `${header}：${values[index] || "-"}`)
+          .join(" · ");
+
+        blocks.push(paragraph(summary));
+        i++;
+      }
+
+      i--;
+      continue;
+    }
+
+    const headingMatch = trimmed.match(/^(#{1,6})\s+(.+)$/);
+    if (headingMatch) {
+      blocks.push(heading(headingMatch[1].length, headingMatch[2]));
+      continue;
+    }
+
+    const bulletMatch = trimmed.match(/^[-*]\s+(.+)$/);
+    if (bulletMatch) {
+      blocks.push(paragraph(`• ${bulletMatch[1]}`));
+      continue;
+    }
+
+    const numberedMatch = trimmed.match(/^(\d+)\.\s+(.+)$/);
+    if (numberedMatch) {
+      blocks.push(paragraph(`${numberedMatch[1]}. ${numberedMatch[2]}`));
+      continue;
+    }
+
+    const quoteMatch = trimmed.match(/^>\s?(.+)$/);
+    if (quoteMatch) {
+      for (const part of splitLongLine(quoteMatch[1])) {
+        blocks.push(paragraph(`摘要：${part}`));
+      }
+      continue;
+    }
+
+    for (const part of splitLongLine(trimmed)) {
       blocks.push(paragraph(part));
     }
   }
@@ -188,7 +305,7 @@ async function createWikiDoc(token: string, title: string) {
   const node = json.data?.node || json.node || json.data;
   const documentId = node.obj_token;
   const nodeToken = node.node_token;
-  const url = `https://bai-zhou.feishu.cn/wiki/${nodeToken}`;
+  const url = `${LARK_WIKI_BASE_URL}/wiki/${nodeToken}`;
 
   if (!documentId || !nodeToken) {
     throw new Error(`Unexpected wiki create response: ${JSON.stringify(json, null, 2)}`);
