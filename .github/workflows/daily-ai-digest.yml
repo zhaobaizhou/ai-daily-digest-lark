@@ -1,0 +1,65 @@
+name: Daily AI Digest
+
+on:
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: "How many recent hours to scan"
+        required: false
+        default: "48"
+      top_n:
+        description: "How many articles to include"
+        required: false
+        default: "15"
+  schedule:
+    # 08:30 Asia/Shanghai every day
+    - cron: "30 0 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-ai-digest
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate digest
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_API_BASE: ${{ secrets.OPENAI_API_BASE }}
+          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
+          HOURS: ${{ github.event.inputs.hours || '48' }}
+          TOP_N: ${{ github.event.inputs.top_n || '15' }}
+        run: |
+          npx -y bun scripts/digest.ts \
+            --hours "$HOURS" \
+            --top-n "$TOP_N" \
+            --lang zh \
+            --output digest.md          
+
+      - name: Publish to Lark wiki
+        env:
+          DIGEST_FILE: digest.md
+          LARK_APP_ID: ${{ secrets.LARK_APP_ID }}
+          LARK_APP_SECRET: ${{ secrets.LARK_APP_SECRET }}
+          LARK_SPACE_ID: ${{ secrets.LARK_SPACE_ID }}
+          LARK_CHAT_ID: ${{ secrets.LARK_CHAT_ID }}
+        run: |
+          npx -y bun scripts/publish-lark.ts          
+
+      - name: Upload digest artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-md
+          path: digest.md
+          if-no-files-found: ignore
